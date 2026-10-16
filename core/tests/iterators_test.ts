@@ -258,3 +258,100 @@ Deno.test("iterators - sync iterator", async () => {
 
   await cleanup(ns, nc);
 });
+
+Deno.test("iterators - next calls settle in the order they were made", async () => {
+  const qi = new QueuedIteratorImpl<number>();
+  const it = qi[Symbol.asyncIterator]();
+
+  // all three wait on an empty queue, then settle in call order
+  const calls = [it.next(), it.next(), it.next()];
+  qi.push(1);
+  qi.push(2);
+  qi.push(3);
+
+  const values = (await Promise.all(calls)).map((r) => r.value);
+  assertEquals(values, [1, 2, 3]);
+});
+
+Deno.test("iterators - return waits for pending next calls", async () => {
+  const qi = new QueuedIteratorImpl<number>();
+  const it = qi[Symbol.asyncIterator]();
+  const order: string[] = [];
+
+  const next = it.next().then((r) => order.push(`next:${r.value}`));
+  const ret = it.return!().then((r) => order.push(`return:${r.done}`));
+  qi.push(7);
+  await Promise.all([next, ret]);
+
+  assertEquals(order, ["next:7", "return:true"]);
+  assertEquals(qi.done, true);
+});
+
+Deno.test("iterators - return before next doesn't stop the queue", async () => {
+  const qi = new QueuedIteratorImpl<number>();
+  const first = qi[Symbol.asyncIterator]();
+  assertEquals(await first.return!(), { value: undefined, done: true });
+  assertEquals(qi.done, false);
+
+  // like an async generator that never started, it ran no cleanup, so
+  // another iterator can still consume the queue
+  const second = qi[Symbol.asyncIterator]();
+  qi.push(1);
+  assertEquals(await second.next(), { value: 1, done: false });
+});
+
+Deno.test("iterators - done results are new objects", async () => {
+  const qi = new QueuedIteratorImpl<number>();
+  const it = qi[Symbol.asyncIterator]();
+  qi.stop();
+
+  const a = await it.next();
+  const b = await it.next();
+  assertEquals(a, { value: undefined, done: true });
+  assertEquals(b, { value: undefined, done: true });
+
+  // changing one result doesn't throw or affect another
+  (a as { value: unknown }).value = 1;
+  assertEquals(b.value, undefined);
+});
+
+Deno.test("iterators - a failed callback rejects next and stops the queue", async () => {
+  const qi = new QueuedIteratorImpl<number>();
+  const it = qi[Symbol.asyncIterator]();
+  qi.push(() => {
+    throw new Error("callback failed");
+  });
+
+  await assertRejects(() => it.next(), Error, "callback failed");
+  assertEquals(qi.done, true);
+  assertEquals(await it.next(), { value: undefined, done: true });
+});
+
+Deno.test("iterators - break stops the queue", async () => {
+  const qi = new QueuedIteratorImpl<number>();
+  qi.push(1);
+  qi.push(2);
+
+  for await (const v of qi) {
+    assertEquals(v, 1);
+    break;
+  }
+
+  assertEquals(qi.done, true);
+  assertEquals(qi.getProcessed(), 1);
+});
+
+Deno.test("iterators - has what an async generator inherits", async () => {
+  const qi = new QueuedIteratorImpl<number>();
+  const it = qi.iterate();
+  assertEquals(it[Symbol.asyncIterator](), it);
+
+  // Symbol.asyncDispose, used by `await using`, returns and stops the queue
+  qi.push(1);
+  assertEquals(await it.next(), { value: 1, done: false });
+  const disposable = it as unknown as AsyncDisposable;
+  assertEquals(typeof disposable[Symbol.asyncDispose], "function");
+  await disposable[Symbol.asyncDispose]();
+  assertEquals(qi.done, true);
+  assertEquals(await it.next(), { value: undefined, done: true });
+});

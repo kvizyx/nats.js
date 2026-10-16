@@ -15,7 +15,7 @@
 
 import { assertEquals } from "@std/assert";
 
-import { decode, Empty, encode } from "../src/encoders.ts";
+import { decode, Empty, encode, utf8Length } from "../src/encoders.ts";
 
 Deno.test("encoders - basics", () => {
   let buf = encode();
@@ -28,4 +28,37 @@ Deno.test("encoders - basics", () => {
   assertEquals(s, "1234");
 
   assertEquals(decode(Empty), "");
+});
+
+Deno.test("encoders - utf8Length matches TextEncoder", () => {
+  const te = new TextEncoder();
+  const samples = [
+    "",
+    "ascii",
+    "\u007f\u0080",
+    "\u07ff\u0800",
+    "héllo wörld",
+    "日本語",
+    "emoji 😀🚀",
+    // lone and reversed surrogates encode as U+FFFD
+    "\ud800",
+    "\udc00",
+    "a\ud800b",
+    "\udc00\ud800",
+    "\ud83d",
+    "x\ud83d",
+  ];
+
+  // every code unit, alone and next to its neighbour
+  for (let code = 0; code <= 0xffff; code += 7) {
+    samples.push(String.fromCharCode(code, code + 1));
+  }
+
+  for (const text of samples) {
+    assertEquals(
+      utf8Length(text),
+      te.encode(text).length,
+      JSON.stringify(text),
+    );
+  }
 });

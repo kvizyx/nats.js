@@ -12,8 +12,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-import type { Deferred, Timeout } from "./util.ts";
-import { deferred, randomToken, timeout } from "./util.ts";
+import type { Deferred } from "./util.ts";
+import { deferred, randomToken } from "./util.ts";
 import type { MuxSubscription } from "./muxsubscription.ts";
 import type {
   Msg,
@@ -128,8 +128,12 @@ export class RequestMany extends BaseRequest implements Request {
 }
 
 export class RequestOne extends BaseRequest implements Request {
-  deferred: Deferred<Msg>;
-  timer: Timeout<Msg>;
+  // What request() hands to the caller; only the request settles it, through
+  // resolve and reject, which the caller can't reach
+  promise: Promise<Msg>;
+  private resolve!: (msg: Msg) => void;
+  private reject!: (err: Error) => void;
+  private timeoutId?: number;
 
   constructor(
     mux: MuxSubscription,
@@ -139,14 +143,63 @@ export class RequestOne extends BaseRequest implements Request {
   ) {
     super(mux, requestSubject, asyncTraces);
     // extend(this, opts);
-    this.deferred = deferred();
-    this.timer = timeout<Msg>(opts.timeout, asyncTraces);
+    this.promise = new Promise<Msg>((resolve, reject) => {
+      this.resolve = resolve;
+      this.reject = reject;
+    });
+
+    // A caller may not wait for the reply; without a handler, a timeout or
+    // cancel would then be an unhandled rejection, which ends a Node process.
+    // Callers that await the promise still get the rejection
+    this.promise.catch(() => {});
+
+    // @ts-ignore: node is not a number
+    this.timeoutId = setTimeout(() => this.timedOut(), opts.timeout);
+  }
+
+  /**
+   * @deprecated await {@link promise} instead. Kept, as the same promise, for
+   * code that raced `timer` with `deferred`, which then still waits for the
+   * reply, a timeout or a cancel.
+   */
+  get deferred(): Promise<Msg> {
+    return this.promise;
+  }
+
+  /**
+   * @deprecated await {@link promise} instead; see {@link deferred}.
+   */
+  get timer(): Promise<Msg> {
+    return this.promise;
+  }
+
+  private timedOut(): void {
+    this.timeoutId = undefined;
+
+    // The error is only built when a request actually times out; it reuses
+    // the stack captured at the call site instead of capturing another one
+    const err = new TimeoutError();
+    if (this.ctx?.stack) {
+      const stack = this.ctx.stack;
+      const newline = stack.indexOf("\n");
+      const frames = newline >= 0 ? stack.slice(newline) : "";
+      err.stack = `${err.name}: ${err.message}${frames}`;
+    }
+
+    this.mux.cancel(this);
+    this.reject(err);
+  }
+
+  private clearTimer(): void {
+    if (this.timeoutId !== undefined) {
+      clearTimeout(this.timeoutId);
+      this.timeoutId = undefined;
+    }
   }
 
   resolver(err: Error | null, msg: Msg): void {
-    if (this.timer) {
-      this.timer.cancel();
-    }
+    this.clearTimer();
+
     if (err) {
       // we have proper stack on timeout
       if (!(err instanceof TimeoutError)) {
@@ -158,19 +211,20 @@ export class RequestOne extends BaseRequest implements Request {
           err = new errors.RequestError(err.message, { cause: err });
         }
       }
-      this.deferred.reject(err);
+      this.reject(err);
     } else {
-      this.deferred.resolve(msg);
+      this.resolve(msg);
     }
-    this.cancel();
+
+    // The promise is settled, so cancel()'s rejection would be a no-op;
+    // skip it to avoid building an Error and its stack per request
+    this.mux.cancel(this);
   }
 
   cancel(err?: Error): void {
-    if (this.timer) {
-      this.timer.cancel();
-    }
+    this.clearTimer();
     this.mux.cancel(this);
-    this.deferred.reject(
+    this.reject(
       err ? err : new RequestError("cancelled"),
     );
   }

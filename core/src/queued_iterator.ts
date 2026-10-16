@@ -84,67 +84,8 @@ export class QueuedIteratorImpl<T> implements QueuedIterator<T>, Dispatcher<T> {
     this.signal.resolve();
   }
 
-  async *iterate(): AsyncIterableIterator<T> {
-    if (this.noIterator) {
-      throw new InvalidOperationError(
-        "iterator cannot be used when a callback is registered",
-      );
-    }
-    if (this.yielding) {
-      throw new InvalidOperationError("iterator is already yielding");
-    }
-    this.yielding = true;
-    try {
-      while (true) {
-        if (this.yields.length === 0) {
-          await this.signal;
-        }
-        if (this.err) {
-          throw this.err;
-        }
-        const yields = this.yields;
-        this.inflight = yields.length;
-        this.yields = [];
-        for (let i = 0; i < yields.length; i++) {
-          if (typeof yields[i] === "function") {
-            this.pendingFiltered--;
-            const fn = yields[i] as CallbackFn;
-            try {
-              fn();
-            } catch (err) {
-              // failed on the invocation - fail the iterator
-              // so they know to fix the callback
-              throw err;
-            }
-            // fn could have also set an error
-            if (this.err) {
-              throw this.err;
-            }
-            continue;
-          }
-
-          this.processed++;
-          this.inflight--;
-          const start = this.profile ? Date.now() : 0;
-          yield yields[i] as T;
-          this.time = this.profile ? Date.now() - start : 0;
-        }
-        // yielding could have paused and microtask
-        // could have added messages. Prevent allocations
-        // if possible
-        if (this.done) {
-          break;
-        } else if (this.yields.length === 0) {
-          yields.length = 0;
-          this.yields = yields;
-          this.signal = deferred();
-        }
-      }
-    } finally {
-      // the iterator used break/return
-      this.didBreak = true;
-      this.stop();
-    }
+  iterate(): AsyncIterableIterator<T> {
+    return new QueuedIteratorIter<T>(this);
   }
 
   stop(err?: Error): void {
@@ -169,3 +110,240 @@ export class QueuedIteratorImpl<T> implements QueuedIterator<T>, Dispatcher<T> {
     return this.received - this.filtered;
   }
 }
+
+// A new result each time, like a generator returns, so that a caller that
+// changes a result doesn't affect other calls
+function doneResult<T>(): IteratorResult<T> {
+  return { value: undefined, done: true };
+}
+
+// The prototype that async generators inherit from; the iterator below
+// inherits from it too, so that it has what they have beyond next, return and
+// throw, such as Symbol.asyncDispose for `await using`
+const AsyncIteratorPrototype = Object.getPrototypeOf(
+  Object.getPrototypeOf(async function* () {}).prototype,
+);
+
+/**
+ * Iterates a QueuedIteratorImpl. Hand-written rather than an async generator:
+ * an item that is already queued resolves without the generator machinery,
+ * which roughly halves the per-message cost.
+ *
+ * It behaves like the generator it replaces: the checks run on the first
+ * next(), calls settle in the order they were made, and finishing (end,
+ * error, break/return) marks the queue as broken and stops it.
+ */
+class QueuedIteratorIter<T> implements AsyncIterableIterator<T> {
+  queue: QueuedIteratorImpl<T>;
+
+  // Batch being yielded; null when a new one must be taken from the queue
+  batch: (T | CallbackFn)[] | null;
+  index: number;
+
+  started: boolean;
+  finished: boolean;
+
+  // Set once the signal was awaited for an empty queue
+  signaled: boolean;
+
+  // Set after an item is yielded, so the next call records its time
+  yielded: boolean;
+  start: number;
+
+  // The last next() that has not settled; later calls queue behind it
+  queued: Promise<IteratorResult<T>> | null;
+
+  constructor(queue: QueuedIteratorImpl<T>) {
+    this.queue = queue;
+    this.batch = null;
+    this.index = 0;
+    this.started = false;
+    this.finished = false;
+    this.signaled = false;
+    this.yielded = false;
+    this.start = 0;
+    this.queued = null;
+  }
+
+  [Symbol.asyncIterator](): AsyncIterableIterator<T> {
+    return this;
+  }
+
+  next(): Promise<IteratorResult<T>> {
+    if (this.queued) {
+      // Like a generator, calls settle in order; a call after a failed one
+      // sees the end
+      const advanceQueued = () => this.advance(false);
+      return this.track(this.queued.then(advanceQueued, advanceQueued));
+    }
+
+    return this.advance(true);
+  }
+
+  // The track flag is false for calls already queued, so they don't
+  // replace the tail
+  advance(track: boolean): Promise<IteratorResult<T>> {
+    let result: IteratorResult<T> | null;
+    try {
+      result = this.step();
+    } catch (err) {
+      return Promise.reject(err);
+    }
+
+    // The common case: an item was already queued
+    if (result) {
+      return Promise.resolve(result);
+    }
+
+    // The queue is empty; wait for the next push or stop
+    const waiting = this.queue.signal.then(() => {
+      this.signaled = true;
+      return this.advance(false);
+    });
+    return track ? this.track(waiting) : waiting;
+  }
+
+  // Makes call the last unsettled call; later calls queue behind it
+  track(call: Promise<IteratorResult<T>>): Promise<IteratorResult<T>> {
+    this.queued = call;
+
+    const clear = () => {
+      if (this.queued === call) {
+        this.queued = null;
+      }
+    };
+    call.then(clear, clear);
+
+    return call;
+  }
+
+  return(): Promise<IteratorResult<T>> {
+    const done = (): IteratorResult<T> => {
+      this.finish();
+      return doneResult();
+    };
+
+    // Like a generator, a return() waits for the calls before it
+    return this.queued
+      ? this.track(this.queued.then(done, done))
+      : Promise.resolve(done());
+  }
+
+  throw(err?: unknown): Promise<IteratorResult<T>> {
+    const fail = (): Promise<IteratorResult<T>> => {
+      this.finish();
+      return Promise.reject(err);
+    };
+
+    return this.queued ? this.track(this.queued.then(fail, fail)) : fail();
+  }
+
+  finish(): void {
+    if (this.finished) {
+      return;
+    }
+    this.finished = true;
+    this.batch = null;
+
+    // A generator that never started doesn't run its finally
+    if (this.started) {
+      this.queue.didBreak = true;
+      this.queue.stop();
+    }
+  }
+
+  // Returns the next result, or null if the queue is empty and the signal
+  // must be awaited; throws, after finishing, if the iterator failed
+  step(): IteratorResult<T> | null {
+    if (this.finished) {
+      return doneResult();
+    }
+
+    const queue = this.queue;
+    if (!this.started) {
+      // Like the generator's prologue, these don't stop the queue
+      if (queue.noIterator) {
+        this.finished = true;
+        throw new InvalidOperationError(
+          "iterator cannot be used when a callback is registered",
+        );
+      }
+      if (queue.yielding) {
+        this.finished = true;
+        throw new InvalidOperationError("iterator is already yielding");
+      }
+
+      queue.yielding = true;
+      this.started = true;
+    }
+
+    // The time the loop body took with the previous item
+    if (this.yielded) {
+      this.yielded = false;
+      queue.time = queue.profile ? Date.now() - this.start : 0;
+    }
+
+    try {
+      while (true) {
+        let batch = this.batch;
+
+        // Take everything queued so far as the next batch
+        if (batch === null) {
+          if (queue.yields.length === 0 && !this.signaled) {
+            return null;
+          }
+          this.signaled = false;
+
+          if (queue.err) {
+            throw queue.err;
+          }
+
+          batch = this.batch = queue.yields;
+          this.index = 0;
+          queue.inflight = batch.length;
+          queue.yields = [];
+        }
+
+        while (this.index < batch.length) {
+          const item = batch[this.index++];
+
+          // Queued functions are internal callbacks, not items
+          if (typeof item === "function") {
+            queue.pendingFiltered--;
+            (item as CallbackFn)();
+
+            // The callback could have also set an error
+            if (queue.err) {
+              throw queue.err;
+            }
+            continue;
+          }
+
+          queue.processed++;
+          queue.inflight--;
+          this.start = queue.profile ? Date.now() : 0;
+          this.yielded = true;
+          return { value: item as T, done: false };
+        }
+
+        this.batch = null;
+
+        // Yielding could have paused and a microtask could have added
+        // messages; reuse the batch array to prevent allocations if possible
+        if (queue.done) {
+          this.finish();
+          return doneResult();
+        } else if (queue.yields.length === 0) {
+          batch.length = 0;
+          queue.yields = batch;
+          queue.signal = deferred();
+        }
+      }
+    } catch (err) {
+      this.finish();
+      throw err;
+    }
+  }
+}
+
+Object.setPrototypeOf(QueuedIteratorIter.prototype, AsyncIteratorPrototype);

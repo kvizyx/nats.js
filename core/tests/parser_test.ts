@@ -591,3 +591,67 @@ Deno.test("parser - describe", () => {
     'INFO: {"server_id":"test"}',
   );
 });
+
+Deno.test("parser - control lines split at any position", () => {
+  const frames = [
+    "MSG foo 1 5\r\nhello\r\n",
+    "MSG foo.bar 22 _INBOX.abc 5\r\nhello\r\n",
+    "MSG\tfoo\t1\t0\r\n\r\n",
+    "HMSG foo 1 12 17\r\nNATS/1.0\r\n\r\nhello\r\n",
+    "HMSG foo.bar 22 _INBOX.abc 12 17\r\nNATS/1.0\r\n\r\nhello\r\n",
+  ];
+
+  const describeMsgs = (d: TestDispatcher) =>
+    d.msgs.map((e) => {
+      const m = e.msg!;
+      return [
+        td.decode(m.subject),
+        m.reply ? td.decode(m.reply) : undefined,
+        m.sid,
+        m.hdr,
+        m.size,
+        td.decode(e.data),
+      ];
+    });
+
+  for (const frame of frames) {
+    const bytes = te.encode(frame + "PING\r\n");
+    const whole = new TestDispatcher();
+    new Parser(whole).parse(bytes);
+    assertEquals(whole.msgs.length, 1, frame);
+
+    for (let at = 1; at < bytes.length; at++) {
+      const split = new TestDispatcher();
+      const p = new Parser(split);
+      p.parse(bytes.slice(0, at));
+      p.parse(bytes.slice(at));
+      assertEquals(describeMsgs(split), describeMsgs(whole), `${frame} @${at}`);
+      assertEquals(split.pings, 1, `${frame} @${at}`);
+    }
+  }
+});
+
+Deno.test("parser - malformed control lines fail the same way", () => {
+  const lines = [
+    "MSG foo\r\n",
+    "MSG foo 1\r\n",
+    "MSG foo x 5\r\n",
+    "MSG foo 1 -5\r\n",
+    "MSG foo 1 a b c\r\n",
+    "MSG foo 1 99999999999999999\r\n",
+    "HMSG foo 1 5\r\n",
+    "HMSG foo 1 6 5\r\n",
+    "HMSG foo 1 a b c d\r\n",
+  ];
+
+  for (const line of lines) {
+    const bytes = te.encode(line);
+    assertThrows(() => new Parser(new NoopDispatcher()).parse(bytes));
+
+    // split inside the arguments too
+    const p = new Parser(new NoopDispatcher());
+    const at = line.indexOf(" ") + 2;
+    p.parse(bytes.slice(0, at));
+    assertThrows(() => p.parse(bytes.slice(at)), Error, undefined, line);
+  }
+});

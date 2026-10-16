@@ -45,6 +45,47 @@ export function encode(...a: string[]): Uint8Array {
   return concat(...bufs);
 }
 
+// UTF-8 sizes by UTF-16 code unit
+const MAX_ONE_BYTE = 0x7f;
+const MAX_TWO_BYTES = 0x7ff;
+const HIGH_SURROGATE_FIRST = 0xd800;
+const HIGH_SURROGATE_LAST = 0xdbff;
+const LOW_SURROGATE_FIRST = 0xdc00;
+const LOW_SURROGATE_LAST = 0xdfff;
+
+/**
+ * Returns the number of bytes TextEncoder produces for text, without
+ * encoding it. A lone surrogate is encoded as U+FFFD, which takes 3 bytes.
+ */
+export function utf8Length(text: string): number {
+  let bytes = 0;
+
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index);
+    if (code <= MAX_ONE_BYTE) {
+      bytes += 1;
+    } else if (code <= MAX_TWO_BYTES) {
+      bytes += 2;
+    } else if (
+      code >= HIGH_SURROGATE_FIRST && code <= HIGH_SURROGATE_LAST &&
+      index + 1 < text.length
+    ) {
+      const next = text.charCodeAt(index + 1);
+      if (next >= LOW_SURROGATE_FIRST && next <= LOW_SURROGATE_LAST) {
+        // A surrogate pair is one code point of 4 bytes
+        bytes += 4;
+        index++;
+      } else {
+        bytes += 3;
+      }
+    } else {
+      bytes += 3;
+    }
+  }
+
+  return bytes;
+}
+
 export function decode(a: Uint8Array): string {
   if (!a || a.length === 0) {
     return "";
