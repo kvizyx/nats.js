@@ -1025,6 +1025,16 @@ Deno.test("basics - port and server are mutually exclusive", async () => {
   );
 });
 
+Deno.test("basics - flusherTimeout must be a positive number", async () => {
+  for (const flusherTimeout of [0, -1, NaN, Infinity]) {
+    await assertRejects(
+      () => connect({ port: 4222, flusherTimeout }),
+      errors.InvalidArgumentError,
+      "'flusherTimeout' must be a positive number of milliseconds",
+    );
+  }
+});
+
 Deno.test("basics - rtt", async () => {
   const { ns, nc } = await setup({}, {
     maxReconnectAttempts: 1,

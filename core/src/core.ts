@@ -883,6 +883,21 @@ export interface ConnectionOptions {
    */
   debug?: boolean;
   /**
+   * Sets the number of milliseconds the server may go without taking any of
+   * the data queued to be sent. Once it has taken none for this long, the
+   * connection fails and the client reconnects, as a server that stopped
+   * reading would never take it. A close that sends what was published
+   * first, such as a reconnect, gives up after the same time without
+   * progress. Like the Go client's FlusherTimeout, except that it counts from
+   * the last data the server took rather than from the start of a write, so
+   * a slow connection that keeps taking data isn't failed. Must be a positive
+   * number; values of a few milliseconds fail busy but healthy connections,
+   * which can fall that far behind. Currently used by the Node.js transport.
+   *
+   * @default 60000 millis
+   */
+  flusherTimeout?: number;
+  /**
    * Sets the maximum count of ping commands that can be awaiting a response
    * before raising a stale connection status {@link StaleConnectionStatus }
    * notification {@link NatsConnection#status} and initiating a reconnect.

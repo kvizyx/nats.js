@@ -16,8 +16,10 @@ import type { ConnectionOptions } from "./nats-base-client";
 import {
   checkOptions,
   DataBuffer,
+  DEFAULT_FLUSHER_TIMEOUT,
   Deferred,
   deferred,
+  delay,
   errors,
   extend,
   extractProtocolMessage,
@@ -37,6 +39,12 @@ import type { NodeConnectionOptions } from "./connect";
 
 export const VERSION = version;
 const LANG = "nats.js";
+// The flusher watch and a close check this many times per flusherTimeout
+// whether the socket took any data, so that they act close to a
+// flusherTimeout after the last progress
+const PROGRESS_CHECKS_PER_TIMEOUT = 10;
+// The longest delay setTimeout takes; a longer one fires at once
+const MAX_TIMER_DELAY = 2 ** 31 - 1;
 
 export class NodeTransport implements Transport {
   socket!: Socket;
@@ -50,6 +58,34 @@ export class NodeTransport implements Transport {
   tlsName = "";
   done = false;
   closeError?: Error;
+
+  // Frames held back while the socket's buffer is full, written in order on
+  // "drain"; writing past a full buffer grows the socket's own queue without
+  // bound, which some runtimes, such as Bun, handle far slower than Node;
+  // frames before backlogStart are already written
+  backlog: Uint8Array[] = [];
+  backlogStart = 0;
+  // Set while the socket's buffer is full and a "drain" is awaited
+  waitingForDrain = false;
+  // Resolved once the frames held back when a close started are written, for
+  // a close that must send them first; frames sent later don't hold it up
+  backlogWritten?: Deferred<void>;
+  // How many of those frames are still in the backlog
+  framesBeforeClose = 0;
+  // When the socket last handed written data to the network or had nothing
+  // to hand, as an idle socket isn't one that stopped making progress; read
+  // from the monotonic clock, so that a change of the system time doesn't
+  // look like progress or a lack of it
+  lastProgress = performance.now();
+  // The one "drain" listener, so that dropping the backlog can remove it
+  private readonly onDrain = () => this.writeBacklog();
+  // Runs while the socket has data it hasn't handed to the network, and fails
+  // the connection once it took none for flusherTimeout, like a write that
+  // misses its deadline in the Go client
+  private flusherWatch?: ReturnType<typeof setTimeout>;
+  // Set once a close started, which bounds its own wait, so that the flusher
+  // watch doesn't start again and fail it
+  private closeStarted = false;
 
   constructor() {
     this.lang = LANG;
@@ -353,6 +389,10 @@ export class NodeTransport implements Transport {
       if (this.socket?.destroyed) {
         return;
       }
+
+      // The server ended the connection, so what is held back can't be sent,
+      // and writing it after end() would fail
+      this.dropBacklog();
       this.socket?.write(new Uint8Array(0), () => {
         this.socket?.end();
       });
@@ -396,6 +436,7 @@ export class NodeTransport implements Transport {
 
   discard() {
     this.done = true;
+    this.dropBacklog();
     if (this.socket) {
       try {
         this.socket.removeAllListeners();
@@ -414,6 +455,8 @@ export class NodeTransport implements Transport {
     return this.socket instanceof TLSSocket;
   }
 
+  // Writes frame directly, ahead of any backlog, and resolves once it is
+  // written; only for the close path, after flushBacklog()
   _send(frame: Uint8Array): Promise<void> {
     if (this.isClosed || this.socket === undefined) {
       return Promise.resolve();
@@ -425,29 +468,259 @@ export class NodeTransport implements Transport {
     try {
       this.socket.write(frame, (err: Error | undefined) => {
         if (err) {
-          if (this.options.debug) {
-            console.error(`!!! ${render(frame)}: ${err}`);
-          }
+          this.debugWriteError(frame, err);
           return d.reject(err);
         }
         return d.resolve();
       });
     } catch (err) {
-      if (this.options.debug) {
-        console.error(`!!! ${render(frame)}: ${err}`);
-      }
+      this.debugWriteError(frame, err);
       d.reject(err);
     }
     return d;
   }
 
   send(frame: Uint8Array): void {
-    const p = this._send(frame);
-    p.catch((_err) => {
-      // we ignore write errors because client will
-      // fail on a read or when the heartbeat timer
-      // detects a stale connection
-    });
+    if (!this.canWrite()) {
+      return;
+    }
+
+    if (this.waitingForDrain) {
+      this.backlog.push(frame);
+      return;
+    }
+
+    this.write(frame);
+  }
+
+  // Writes frame and returns false once the socket's buffer is full, after
+  // which frames wait in the backlog until the next "drain"; write errors are
+  // ignored here, as the client fails on a read, the flusher watch fails a
+  // connection that stopped taking data, and the heartbeat timer detects a
+  // stale one
+  private write(frame: Uint8Array): boolean {
+    if (this.options.debug) {
+      console.info(`< ${render(frame)}`);
+    }
+
+    if (this.socket.writableLength === 0) {
+      this.lastProgress = performance.now();
+    }
+
+    let hasRoom = true;
+    try {
+      hasRoom = this.socket.write(frame, (err: Error | null | undefined) => {
+        if (err) {
+          this.debugWriteError(frame, err);
+        } else {
+          this.lastProgress = performance.now();
+        }
+      });
+    } catch (err) {
+      this.debugWriteError(frame, err);
+    }
+
+    if (!hasRoom) {
+      this.waitingForDrain = true;
+      this.socket.once("drain", this.onDrain);
+    }
+
+    // Like the Go client's deadline on every write, any data the socket
+    // couldn't hand to the network right away is watched
+    if (this.socket.writableLength > 0) {
+      this.watchFlusher();
+    }
+
+    return hasRoom;
+  }
+
+  private flusherTimeout(): number {
+    return this.options.flusherTimeout ?? DEFAULT_FLUSHER_TIMEOUT;
+  }
+
+  // True while frames are held back or the socket holds data it hasn't
+  // handed to the network
+  private hasUnsentData(): boolean {
+    if (this.waitingForDrain) {
+      return true;
+    }
+
+    if (this.socket === undefined) {
+      return false;
+    }
+
+    return this.socket.writableLength > 0;
+  }
+
+  // Starts the flusher watch unless it runs already or a close started; it
+  // stops on its own once nothing is left unsent
+  private watchFlusher(): void {
+    if (this.flusherWatch !== undefined) {
+      return;
+    }
+
+    if (this.closeStarted) {
+      return;
+    }
+
+    const timeout = this.flusherTimeout();
+    const interval = Math.min(
+      timeout / PROGRESS_CHECKS_PER_TIMEOUT,
+      MAX_TIMER_DELAY,
+    );
+
+    const check = () => {
+      this.flusherWatch = undefined;
+      if (this.socket === undefined) {
+        return;
+      }
+
+      if (!this.hasUnsentData()) {
+        return;
+      }
+
+      const stalledFor = performance.now() - this.lastProgress;
+      if (stalledFor >= timeout) {
+        // The "close" that follows closes the transport with this error, and
+        // the client reconnects
+        this.socket.destroy(
+          new errors.ConnectionError(
+            `flusher timeout: the server took no data for ${timeout}ms`,
+          ),
+        );
+        return;
+      }
+
+      this.flusherWatch = setTimeout(check, interval);
+    };
+
+    this.flusherWatch = setTimeout(check, interval);
+  }
+
+  private stopFlusherWatch(): void {
+    if (this.flusherWatch !== undefined) {
+      clearTimeout(this.flusherWatch);
+      this.flusherWatch = undefined;
+    }
+  }
+
+  // Logs a frame that couldn't be written, when debugging
+  private debugWriteError(frame: Uint8Array, err: unknown): void {
+    if (this.options.debug) {
+      console.error(`< ${render(frame)} failed: ${err}`);
+    }
+  }
+
+  // False once the socket can't take frames: it is gone or the server ended
+  // it, and writing after end() fails
+  private canWrite(): boolean {
+    if (this.isClosed || this.socket === undefined) {
+      return false;
+    }
+
+    return !this.socket.writableEnded;
+  }
+
+  private writeBacklog(): void {
+    this.waitingForDrain = false;
+    if (!this.canWrite()) {
+      this.dropBacklog();
+      return;
+    }
+
+    const frames = this.backlog;
+    while (this.backlogStart < frames.length) {
+      const frame = frames[this.backlogStart++];
+      const hasRoom = this.write(frame);
+      this.frameWrittenBeforeClose();
+
+      if (!hasRoom) {
+        // The rest waits for the next drain; drop what was written once it is
+        // most of the array, so that each frame is copied about once
+        if (this.backlogStart * 2 > frames.length) {
+          this.backlog = frames.slice(this.backlogStart);
+          this.backlogStart = 0;
+        }
+        return;
+      }
+    }
+
+    this.clearBacklog();
+  }
+
+  // Counts a frame a close waits for, and releases the close after the last
+  private frameWrittenBeforeClose(): void {
+    if (!this.backlogWritten) {
+      return;
+    }
+
+    this.framesBeforeClose--;
+    if (this.framesBeforeClose === 0) {
+      this.backlogWritten.resolve();
+      this.backlogWritten = undefined;
+    }
+  }
+
+  private clearBacklog(): void {
+    this.backlog = [];
+    this.backlogStart = 0;
+  }
+
+  // Forgets the frames held back, for a socket that can't take them anymore,
+  // and releases a close waiting for them
+  private dropBacklog(): void {
+    this.stopFlusherWatch();
+    this.socket?.off("drain", this.onDrain);
+    this.clearBacklog();
+    this.waitingForDrain = false;
+    this.backlogWritten?.resolve();
+    this.backlogWritten = undefined;
+  }
+
+  // Resolves once sent settles, or once the socket took no data for idle ms,
+  // counting from the last data it took; a peer that stopped reading would
+  // never let sent settle, while a slow one keeps taking data
+  private async untilSentOrStalled(
+    sent: Promise<void>,
+    idle: number,
+  ): Promise<void> {
+    let settled = false;
+    const finished = sent.then(
+      () => settled = true,
+      () => settled = true,
+    );
+
+    const interval = Math.min(
+      idle / PROGRESS_CHECKS_PER_TIMEOUT,
+      MAX_TIMER_DELAY,
+    );
+    while (!settled) {
+      const stalledFor = performance.now() - this.lastProgress;
+      if (stalledFor >= idle) {
+        return;
+      }
+
+      const timer = delay(interval);
+      await Promise.race([finished, timer]);
+      timer.cancel();
+    }
+  }
+
+  // Resolves once every frame passed to send() so far has been handed to the
+  // socket
+  private flushBacklog(): Promise<void> {
+    // A full socket buffer with nothing held back needs no wait here, as the
+    // close's own write goes after what the socket holds
+    if (this.backlogStart === this.backlog.length) {
+      return Promise.resolve();
+    }
+
+    if (!this.backlogWritten) {
+      this.framesBeforeClose = this.backlog.length - this.backlogStart;
+      this.backlogWritten = deferred<void>();
+    }
+
+    return this.backlogWritten;
   }
 
   private async _closed(err?: Error, internal = true): Promise<void> {
@@ -458,16 +731,25 @@ export class NodeTransport implements Transport {
       return;
     }
     this.closeError = err;
+    // A close bounds its own wait, and reports no error for it
+    this.closeStarted = true;
+    this.stopFlusherWatch();
     // only try to flush the outbound buffer if we got no error and
     // the close is internal, if the transport closed, we are done.
     if (!err && this.socket && internal) {
-      try {
-        await this._send(new TextEncoder().encode(""));
-      } catch (err) {
+      const flushed = this.flushBacklog()
+        .then(() => this._send(new Uint8Array(0)));
+      // If the wait gives up first, a later write error must not go unhandled
+      flushed.catch((err) => {
         if (this.options.debug) {
           console.log("transport close terminated with an error", err);
         }
-      }
+      });
+
+      await this.untilSentOrStalled(
+        flushed,
+        this.flusherTimeout(),
+      );
     }
     try {
       if (this.socket) {
@@ -478,6 +760,10 @@ export class NodeTransport implements Transport {
     } catch (err) {
       console.log(err);
     }
+
+    // The socket is gone, so a backlog that wasn't written never will be;
+    // don't leave a close waiting for it
+    this.dropBacklog();
 
     this.done = true;
     this.closedNotification.resolve(this.closeError);

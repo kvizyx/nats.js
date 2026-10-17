@@ -54,6 +54,7 @@ export {
   buildAuthenticator,
   checkOptions,
   checkUnsupportedOption,
+  DEFAULT_FLUSHER_TIMEOUT,
   DEFAULT_MAX_RECONNECT_ATTEMPTS,
   defaultOptions,
   hasWsProtocol,

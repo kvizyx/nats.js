@@ -34,6 +34,8 @@ export const DEFAULT_MAX_PING_OUT = 2;
 
 // DISCONNECT Parameters, 2 sec wait, 10 tries
 export const DEFAULT_RECONNECT_TIME_WAIT = 2 * 1000;
+// How long the server may go without taking any of the data queued to be sent
+export const DEFAULT_FLUSHER_TIMEOUT = 60 * 1000;
 
 export function defaultOptions(): ConnectionOptions {
   return {
@@ -135,6 +137,16 @@ export function parseOptions(opts?: ConnectionOptions): ConnectionOptions {
       }
       return options.reconnectTimeWait + extra;
     };
+  }
+
+  const { flusherTimeout } = options;
+  if (flusherTimeout !== undefined) {
+    if (!Number.isFinite(flusherTimeout) || flusherTimeout <= 0) {
+      throw InvalidArgumentError.format(
+        "flusherTimeout",
+        "must be a positive number of milliseconds",
+      );
+    }
   }
 
   if (options.inboxPrefix) {
