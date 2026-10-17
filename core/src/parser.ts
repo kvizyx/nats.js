@@ -109,7 +109,10 @@ export class Parser {
   hdr: number;
   ma!: MsgArg;
   argBuf?: DenoBuffer;
-  msgBuf?: DenoBuffer;
+  // Payload of a message that continues past the end of a read, allocated at
+  // its full size once; msgLen is how much of it has arrived so far
+  msgBuf?: Uint8Array;
+  msgLen = 0;
   // Bounds [start, end) of each token of the last tokenized control line
   tokens: Int32Array = new Int32Array(MAX_TOKENS * 2);
 
@@ -262,28 +265,24 @@ export class Parser {
           break;
         case State.MSG_PAYLOAD:
           if (this.msgBuf) {
-            if (this.msgBuf.length >= this.ma.size) {
-              const data = this.msgBuf.bytes({ copy: false });
+            if (this.msgLen >= this.ma.size) {
               this.dispatcher.push(
-                { kind: Kind.MSG, msg: this.ma, data: data },
+                { kind: Kind.MSG, msg: this.ma, data: this.msgBuf },
               );
               this.argBuf = undefined;
               this.msgBuf = undefined;
+              this.msgLen = 0;
               this.state = State.MSG_END;
             } else {
-              let toCopy = this.ma.size - this.msgBuf.length;
-              const avail = buf.length - i;
-
-              if (avail < toCopy) {
-                toCopy = avail;
-              }
-
-              if (toCopy > 0) {
-                this.msgBuf.write(buf.subarray(i, i + toCopy));
-                i = (i + toCopy) - 1;
-              } else {
-                this.msgBuf.writeByte(b);
-              }
+              // Copy as much of the rest of the payload as this read has; at
+              // least one byte, as both the payload and the read have some left
+              const count = Math.min(
+                this.ma.size - this.msgLen,
+                buf.length - i,
+              );
+              this.msgBuf.set(buf.subarray(i, i + count), this.msgLen);
+              this.msgLen += count;
+              i += count - 1;
             }
           } else if (i - this.as >= this.ma.size) {
             this.dispatcher.push(
@@ -569,25 +568,18 @@ export class Parser {
     }
 
     if (this.state === State.MSG_PAYLOAD && !this.msgBuf) {
-      if (!this.argBuf) {
-        this.cloneMsgArg();
-      }
-      this.msgBuf = new DenoBuffer(buf.subarray(this.as));
-    }
-  }
+      // The subject and reply are left as views of this read, like those of a
+      // message that fits in one read; dispatched messages reference a read's
+      // bytes, so transports never reuse its buffer
 
-  cloneMsgArg() {
-    const s = this.ma.subject.length;
-    const r = this.ma.reply ? this.ma.reply.length : 0;
-    const buf = new Uint8Array(s + r);
-    buf.set(this.ma.subject);
-    if (this.ma.reply) {
-      buf.set(this.ma.reply, s);
-    }
-    this.argBuf = new DenoBuffer(buf);
-    this.ma.subject = buf.subarray(0, s);
-    if (this.ma.reply) {
-      this.ma.reply = buf.subarray(s);
+      // The payload continues in the next read; its size is known, so it is
+      // allocated once rather than grown as the rest arrives; this read holds
+      // at most the whole payload, as a byte after it would have dispatched
+      // it, and if it held more, set would throw rather than drop bytes
+      const head = buf.subarray(this.as);
+      this.msgBuf = new Uint8Array(this.ma.size);
+      this.msgBuf.set(head);
+      this.msgLen = head.length;
     }
   }
 
