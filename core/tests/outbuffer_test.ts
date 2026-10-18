@@ -14,7 +14,7 @@
  */
 
 import { assert, assertEquals, assertThrows } from "@std/assert";
-import { OutBuffer, safeIntDigits } from "../src/outbuffer.ts";
+import { formatSafeInt, OutBuffer } from "../src/outbuffer.ts";
 import { utf8Length } from "../src/encoders.ts";
 
 const te = new TextEncoder();
@@ -163,20 +163,11 @@ Deno.test("outbuffer - a write that throws leaves no partial frame", () => {
 
 Deno.test("outbuffer - only safe integers are written as sizes", () => {
   for (const v of [-1, 1.5, NaN, Infinity, 2 ** 53, 2 ** 60]) {
-    assertThrows(() => safeIntDigits(v), RangeError);
+    assertThrows(() => formatSafeInt(v), RangeError);
   }
 
-  const cases: [number, number][] = [
-    [0, 1],
-    [9, 1],
-    [10, 2],
-    [99, 2],
-    [100, 3],
-    [2 ** 31, 10],
-    [Number.MAX_SAFE_INTEGER, 16],
-  ];
-  for (const [value, digits] of cases) {
-    assertEquals(safeIntDigits(value), digits, `${value}`);
+  for (const v of [0, 9, 10, 2 ** 31, Number.MAX_SAFE_INTEGER]) {
+    assertEquals(formatSafeInt(v), `${v}`);
   }
 });
 

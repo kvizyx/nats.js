@@ -125,6 +125,7 @@ export class SplitPayload {
       this.bytes.length - this.received,
       read.length - start,
     );
+
     this.bytes.set(read.subarray(start, start + count), this.received);
     this.received += count;
 
@@ -174,11 +175,10 @@ const MAX_64MB = 64 * 1024 * 1024;
 // sid, reply, header size and total size
 const MAX_TOKENS = 5;
 
-// Plain numbers rather than cc.* so the per-byte checks compile to constants
-const SPACE = 32;
-const TAB = 9;
-const CR = 13;
-const NL = 10;
+function isSeparator(byte: number): boolean {
+  return byte === cc.SPACE || byte === cc.TAB || byte === cc.CR ||
+    byte === cc.NL;
+}
 
 export class Parser {
   dispatcher: Dispatcher<ParserEvent>;
@@ -631,22 +631,16 @@ export class Parser {
     while (pos < end) {
       // Skip separators
       let byte = line[pos];
-      if (
-        byte <= SPACE &&
-        (byte === SPACE || byte === TAB || byte === CR || byte === NL)
-      ) {
+      if (isSeparator(byte)) {
         pos++;
         continue;
       }
 
-      // Scan the token; printable bytes take a single compare
+      // Scan the token
       const start = pos;
       for (pos++; pos < end; pos++) {
         byte = line[pos];
-        if (
-          byte <= SPACE &&
-          (byte === SPACE || byte === TAB || byte === CR || byte === NL)
-        ) {
+        if (isSeparator(byte)) {
           break;
         }
       }

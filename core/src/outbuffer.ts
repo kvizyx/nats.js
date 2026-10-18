@@ -23,7 +23,6 @@ const MAX_UTF8_PER_UNIT = 3;
 // The last ASCII code; characters up to it encode to a single UTF-8 byte
 // equal to their code
 const MAX_ASCII = 0x7f;
-const ASCII_0 = 48;
 
 // Pieces of the PUB and HPUB control lines
 const PUB = TE.encode("PUB");
@@ -289,36 +288,18 @@ export class OutBuffer {
 
   // Writes value as decimal digits
   private writeSafeInt(value: number): void {
-    const digits = safeIntDigits(value);
-    this.ensure(digits);
-
-    // Write the digits backwards from the last one; (value - digit) / 10 is
-    // exact integer division and, unlike | 0, also works past 2^31
-    const out = this.buf;
-    let pos = this.len + digits;
-    this.len = pos;
-
-    do {
-      const digit = value % 10;
-      out[--pos] = ASCII_0 + digit;
-      value = (value - digit) / 10;
-    } while (value > 0);
+    this.writeString(formatSafeInt(value));
   }
 }
 
 /**
- * Returns the number of decimal digits of value. Only non-negative safe
- * integers are written exactly, so any other value throws.
+ * Returns value as decimal digits. Only non-negative safe integers are
+ * written exactly, so any other value throws.
  */
-export function safeIntDigits(value: number): number {
+export function formatSafeInt(value: number): string {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new RangeError(`expected a non-negative safe integer, got ${value}`);
   }
 
-  let digits = 1;
-  for (let power = 10; power <= value; power *= 10) {
-    digits++;
-  }
-
-  return digits;
+  return String(value);
 }
