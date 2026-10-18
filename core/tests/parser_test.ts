@@ -300,8 +300,8 @@ Deno.test("parser - split msg", () => {
   assertEquals(p.ma.sid, 1);
   assertEquals(td.decode(p.ma.subject), "a");
   assertEquals(td.decode(p.ma.reply), "b");
-  assertEquals(p.msgBuf?.length, 103);
-  assertEquals(p.msgLen, 3);
+  assertEquals(p.msgBuf?.bytes.length, 103);
+  assertEquals(p.msgBuf?.length, 3);
   const a = "a".charCodeAt(0); //97
   for (let i = 0; i < payload.length; i++) {
     payload[i] = a + (i % 26);

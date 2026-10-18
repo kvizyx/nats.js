@@ -85,6 +85,85 @@ function newMsgArg(): MsgArg {
   };
 }
 
+/**
+ * The payload of a message that continues past the end of a read. Its size
+ * is known from the control line, so it is allocated once and filled as the
+ * reads arrive, rather than grown.
+ */
+export class SplitPayload {
+  readonly bytes: Uint8Array;
+  private received: number;
+
+  constructor(head: Uint8Array, size: number) {
+    // A read holds at most the whole payload, as a byte after it would have
+    // dispatched it; if it held more, set would throw rather than drop bytes
+    this.bytes = new Uint8Array(size);
+    this.bytes.set(head);
+    this.received = head.length;
+  }
+
+  /**
+   * Returns the number of bytes of the payload that have arrived.
+   */
+  get length(): number {
+    return this.received;
+  }
+
+  /**
+   * Returns true once the whole payload has arrived.
+   */
+  isComplete(): boolean {
+    return this.received === this.bytes.length;
+  }
+
+  /**
+   * Copies as much of the rest of the payload as read holds from start on,
+   * and returns the number of bytes copied.
+   */
+  fill(read: Uint8Array, start: number): number {
+    const count = Math.min(
+      this.bytes.length - this.received,
+      read.length - start,
+    );
+    this.bytes.set(read.subarray(start, start + count), this.received);
+    this.received += count;
+
+    return count;
+  }
+}
+
+// The control line at start began in a previous read: appends it to argBuf
+// up to the next CR or NL in one write instead of byte by byte, and returns
+// the index of the last byte appended; like the byte by byte copy did, it
+// leaves a CR to the CR case, which drops it from the line
+function appendLine(
+  argBuf: DenoBuffer,
+  buf: Uint8Array,
+  start: number,
+): number {
+  const newline = buf.indexOf(cc.NL, start);
+  const lineEnd = newline < 0 ? buf.length : newline;
+
+  // Only search the line for a CR, not the payload after it
+  const cr = buf.subarray(start, lineEnd).indexOf(cc.CR);
+  const end = cr < 0 ? lineEnd : start + cr;
+
+  argBuf.write(buf.subarray(start, end));
+  return end - 1;
+}
+
+// Returns the index of the byte before the CR or NL that ends the control
+// line at start, found with a native scan; if the line continues in the next
+// read, its last byte may be the CR, so that byte is left to the state machine
+function skipLine(buf: Uint8Array, start: number): number {
+  const newline = buf.indexOf(cc.NL, start + 1);
+  if (newline < 0) {
+    return Math.max(start, buf.length - 2);
+  }
+
+  return (buf[newline - 1] === cc.CR ? newline - 1 : newline) - 1;
+}
+
 const ASCII_0 = 48;
 const ASCII_9 = 57;
 const MAX_64MB = 64 * 1024 * 1024;
@@ -109,10 +188,7 @@ export class Parser {
   hdr: number;
   ma!: MsgArg;
   argBuf?: DenoBuffer;
-  // Payload of a message that continues past the end of a read, allocated at
-  // its full size once; msgLen is how much of it has arrived so far
-  msgBuf?: Uint8Array;
-  msgLen = 0;
+  msgBuf?: SplitPayload;
   // Bounds [start, end) of each token of the last tokenized control line
   tokens: Int32Array = new Int32Array(MAX_TOKENS * 2);
 
@@ -233,56 +309,26 @@ export class Parser {
               break;
             }
             default:
-              // Both branches move i to the byte before the next CR or NL (or
-              // to the end of buf), so that the cases above handle it
-              if (this.argBuf) {
-                // The line started in a previous read; copy up to the next
-                // CR or NL in one write instead of byte by byte. Like the
-                // byte by byte copy did, a CR is left to the CR case, which
-                // drops it from the line
-                const newline = buf.indexOf(cc.NL, i);
-                const lineEnd = newline < 0 ? buf.length : newline;
-                const line = buf.subarray(i, lineEnd);
-
-                // Only search the line for a CR, not the payload after it
-                const cr = line.indexOf(cc.CR);
-                const end = cr < 0 ? lineEnd : i + cr;
-
-                this.argBuf.write(buf.subarray(i, end));
-                i = end - 1;
-              } else {
-                // Jump to the end of the line with a native scan
-                const newline = buf.indexOf(cc.NL, i + 1);
-                if (newline < 0) {
-                  // The line continues in the next read; the last byte may
-                  // be its CR, so leave it to the state machine
-                  i = Math.max(i, buf.length - 2);
-                } else {
-                  i = (buf[newline - 1] === cc.CR ? newline - 1 : newline) - 1;
-                }
-              }
+              // Move i to the byte before the CR or NL that ends the line, or
+              // to the end of buf, so that the cases above handle it
+              i = this.argBuf
+                ? appendLine(this.argBuf, buf, i)
+                : skipLine(buf, i);
           }
           break;
         case State.MSG_PAYLOAD:
           if (this.msgBuf) {
-            if (this.msgLen >= this.ma.size) {
+            if (this.msgBuf.isComplete()) {
               this.dispatcher.push(
-                { kind: Kind.MSG, msg: this.ma, data: this.msgBuf },
+                { kind: Kind.MSG, msg: this.ma, data: this.msgBuf.bytes },
               );
               this.argBuf = undefined;
               this.msgBuf = undefined;
-              this.msgLen = 0;
               this.state = State.MSG_END;
             } else {
-              // Copy as much of the rest of the payload as this read has; at
-              // least one byte, as both the payload and the read have some left
-              const count = Math.min(
-                this.ma.size - this.msgLen,
-                buf.length - i,
-              );
-              this.msgBuf.set(buf.subarray(i, i + count), this.msgLen);
-              this.msgLen += count;
-              i += count - 1;
+              // At least one byte is copied, as both the payload and the read
+              // have some left
+              i += this.msgBuf.fill(buf, i) - 1;
             }
           } else if (i - this.as >= this.ma.size) {
             this.dispatcher.push(
@@ -568,18 +614,11 @@ export class Parser {
     }
 
     if (this.state === State.MSG_PAYLOAD && !this.msgBuf) {
-      // The subject and reply are left as views of this read, like those of a
-      // message that fits in one read; dispatched messages reference a read's
-      // bytes, so transports never reuse its buffer
-
-      // The payload continues in the next read; its size is known, so it is
-      // allocated once rather than grown as the rest arrives; this read holds
-      // at most the whole payload, as a byte after it would have dispatched
-      // it, and if it held more, set would throw rather than drop bytes
-      const head = buf.subarray(this.as);
-      this.msgBuf = new Uint8Array(this.ma.size);
-      this.msgBuf.set(head);
-      this.msgLen = head.length;
+      // The payload continues in the next read; the subject and reply are left
+      // as views of this read, like those of a message that fits in one read,
+      // as dispatched messages reference a read's bytes and transports never
+      // reuse its buffer
+      this.msgBuf = new SplitPayload(buf.subarray(this.as), this.ma.size);
     }
   }
 
@@ -658,20 +697,14 @@ export class Parser {
         this.ma.size = this.tokenInt(buf, 3, MAX_64MB);
         break;
       default:
-        throw this.fail(buf.subarray(start, end), "processMsgArgs Parse Error");
+        throw this.argsError(buf, start, end, "Parse Error");
     }
 
     if (this.ma.sid < 0) {
-      throw this.fail(
-        buf.subarray(start, end),
-        "processMsgArgs Bad or Missing Sid Error",
-      );
+      throw this.argsError(buf, start, end, "Bad or Missing Sid Error");
     }
     if (this.ma.size < 0) {
-      throw this.fail(
-        buf.subarray(start, end),
-        "processMsgArgs Bad or Missing Size Error",
-      );
+      throw this.argsError(buf, start, end, "Bad or Missing Size Error");
     }
   }
 
@@ -702,30 +735,30 @@ export class Parser {
         this.ma.size = this.tokenInt(buf, 4, MAX_64MB);
         break;
       default:
-        throw this.fail(
-          buf.subarray(start, end),
-          "processHeaderMsgArgs Parse Error",
-        );
+        throw this.argsError(buf, start, end, "Parse Error");
     }
 
     if (this.ma.sid < 0) {
-      throw this.fail(
-        buf.subarray(start, end),
-        "processHeaderMsgArgs Bad or Missing Sid Error",
-      );
+      throw this.argsError(buf, start, end, "Bad or Missing Sid Error");
     }
     if (this.ma.hdr < 0 || this.ma.hdr > this.ma.size) {
-      throw this.fail(
-        buf.subarray(start, end),
-        "processHeaderMsgArgs Bad or Missing Header Size Error",
-      );
+      throw this.argsError(buf, start, end, "Bad or Missing Header Size Error");
     }
     if (this.ma.size < 0) {
-      throw this.fail(
-        buf.subarray(start, end),
-        "processHeaderMsgArgs Bad or Missing Size Error",
-      );
+      throw this.argsError(buf, start, end, "Bad or Missing Size Error");
     }
+  }
+
+  // The error for the malformed MSG or HMSG arguments in buf[start, end); only
+  // built on failure, so that a valid line takes no extra work
+  argsError(
+    buf: Uint8Array,
+    start: number,
+    end: number,
+    problem: string,
+  ): Error {
+    const label = this.hdr >= 0 ? "processHeaderMsgArgs" : "processMsgArgs";
+    return this.fail(buf.subarray(start, end), `${label} ${problem}`);
   }
 
   // Same as protoParseInt, over bytes[start, end)
