@@ -192,12 +192,21 @@ Deno.test("outbuffer - drained frames are not changed by later writes", () => {
   assertEquals(td.decode(small), "PUB a 5\r\nfirst\r\n");
   ob.drain();
 
-  // large frames hand off the buffer itself
+  // two large frames fill the buffer, which is handed off itself: the frame
+  // is a view of it rather than an exact copy
   const big = new Uint8Array(200_000).fill(1);
   writeBytes(ob, "c", "", null, big);
+  writeBytes(ob, "c", "", null, big);
   const large = ob.drain();
+  assert(large.buffer.byteLength > large.length);
+  assert(large.buffer.byteLength < large.length * 1.1);
   writeBytes(ob, "d", "", null, new Uint8Array(200_000).fill(2));
-  assertSameBytes(large, expectedFrame("c", "", null, big));
+  writeBytes(ob, "d", "", null, new Uint8Array(200_000).fill(2));
+  const frame = expectedFrame("c", "", null, big);
+  const both = new Uint8Array(frame.length * 2);
+  both.set(frame);
+  both.set(frame, frame.length);
+  assertSameBytes(large, both);
 });
 
 Deno.test("outbuffer - frames of many sizes", () => {
@@ -228,6 +237,30 @@ Deno.test("outbuffer - frames of many sizes", () => {
   };
   assertSameBytes(join(drained), join(expected));
   assertEquals(ob.size(), 0);
+});
+
+Deno.test("outbuffer - a large frame doesn't hold an unused buffer", () => {
+  const big = new Uint8Array(100 * 1024).fill(7);
+  const small = new Uint8Array(1024);
+
+  // a single large frame, and one after small frames that didn't reach a
+  // flush; the room a grow leaves for another frame is never filled
+  const cases: Uint8Array[][] = [[big], [...Array(30).fill(small), big]];
+  for (const payloads of cases) {
+    const ob = new OutBuffer();
+    for (const payload of payloads) {
+      writeBytes(ob, "s", "", null, payload);
+    }
+
+    const frame = ob.drain();
+    // the transport holds the frame's whole backing buffer until it is
+    // written
+    assert(frame.buffer.byteLength < 2 * frame.length);
+    assertSameBytes(
+      frame.subarray(frame.length - big.length - 2),
+      expectedFrame("s", "", null, big).subarray(-big.length - 2),
+    );
+  }
 });
 
 Deno.test("outbuffer - a huge frame doesn't hold twice its size", () => {

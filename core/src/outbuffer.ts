@@ -106,17 +106,22 @@ export class OutBuffer {
   }
 
   /**
-   * Returns the pending bytes as a buffer the caller owns. Up to the initial
-   * size they are copied so the internal buffer can be reused. Larger ones
-   * hand off the internal buffer without a copy, and the next write allocates
-   * a new one, which also releases memory after a burst of large messages.
-   * The returned view may not span its whole ArrayBuffer.
+   * Returns the pending bytes as a buffer the caller owns. Large ones that
+   * fill most of the internal buffer hand it off without a copy, and the next
+   * write allocates a new one; the rest are copied out and the buffer is
+   * reused, so that a frame waiting in a transport's queue never keeps more
+   * than its own size of unused buffer alive. A buffer kept this way stays
+   * until reset(); it only held frames up to about MAX_FRAME_HEADROOM, as
+   * larger ones fill most of their buffer and are handed off, so it is a few
+   * times that size at most. Releasing it once smaller frames follow would
+   * allocate it again for every large frame when large and small ones take
+   * turns. The returned view may not span its whole ArrayBuffer.
    */
   drain(): Uint8Array {
     const pending = this.len;
     this.len = 0;
 
-    if (pending > INITIAL_SIZE) {
+    if (this.worthHandingOff(pending)) {
       const frame = this.buf.subarray(0, pending);
       this.buf = NONE;
       return frame;
@@ -196,6 +201,20 @@ export class OutBuffer {
       this.len = start;
       throw err;
     }
+  }
+
+  // True when pending bytes are better handed off with the buffer than
+  // copied out of it: handing off saves copying frames that already fill the
+  // buffer, as two large frames written before a drain fill the room a grow
+  // leaves, while a buffer they use less than half of is cheaper to copy out
+  // of and reuse than to allocate again at twice their size. Frames up to the
+  // initial size are always copied, so that the buffer is reused
+  private worthHandingOff(pending: number): boolean {
+    if (pending <= INITIAL_SIZE) {
+      return false;
+    }
+
+    return pending * 2 >= this.buf.length;
   }
 
   // Makes room for count more bytes; only the check lives here so that it is
