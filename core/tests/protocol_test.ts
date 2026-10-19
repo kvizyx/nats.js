@@ -38,7 +38,7 @@ Deno.test("protocol - mux subscription cancel", async () => {
 
   const check = assertRejects(
     () => {
-      return Promise.race([r.deferred, r.timer]);
+      return r.promise;
     },
     errors.RequestError,
     "cancelled",
@@ -47,6 +47,22 @@ Deno.test("protocol - mux subscription cancel", async () => {
   r.cancel();
 
   await check;
+  assertEquals(mux.size(), 0);
+});
+
+Deno.test("protocol - racing the old timer and deferred still waits", async () => {
+  const mux = new MuxSubscription();
+  mux.init();
+
+  // code written for the old RequestOne raced its timeout promise with its
+  // deferred; both now return the request's promise
+  const r = new RequestOne(mux, "", { timeout: 200 });
+  mux.add(r);
+
+  const start = Date.now();
+  const race = Promise.race([r.timer, r.deferred]);
+  await assertRejects(() => race, errors.TimeoutError);
+  assertEquals(Date.now() - start >= 150, true);
   assertEquals(mux.size(), 0);
 });
 

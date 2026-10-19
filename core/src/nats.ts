@@ -458,11 +458,8 @@ export class NatsConnectionImpl implements NatsConnection {
         r.cancel(err as Error);
       }
 
-      const p = Promise.race([r.timer, r.deferred]);
-      p.catch(() => {
-        r.cancel();
-      });
-      return p;
+      // The request removes itself from the mux on response or timeout
+      return r.promise;
     }
   }
 

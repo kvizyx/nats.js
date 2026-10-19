@@ -301,7 +301,8 @@ export class JsMsgImpl implements JsMsg {
           r.cancel(err as Error);
         }
         try {
-          await Promise.race([r.timer, r.deferred]);
+          // The request rejects on its own when it times out
+          await r.promise;
           d.resolve(true);
         } catch (err) {
           r.cancel(err as Error);
