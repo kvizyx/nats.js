@@ -70,13 +70,99 @@ export interface MsgArg {
   size: number;
 }
 
-function newMsgArg(): MsgArg {
-  const ma = {} as MsgArg;
-  ma.sid = -1;
-  ma.hdr = -1;
-  ma.size = -1;
+// Placeholder subject of a new MsgArg; it is only read in the MSG_PAYLOAD
+// state, which processMsgArgs enters after setting the real subject. Being
+// empty, it has nothing that could be modified, so it can be shared
+const NO_SUBJECT = new Uint8Array(0);
 
-  return ma;
+function newMsgArg(): MsgArg {
+  return {
+    subject: NO_SUBJECT,
+    reply: undefined,
+    sid: -1,
+    hdr: -1,
+    size: -1,
+  };
+}
+
+/**
+ * The payload of a message that continues past the end of a read. Its size
+ * is known from the control line, so it is allocated once and filled as the
+ * reads arrive, rather than grown.
+ */
+export class SplitPayload {
+  readonly bytes: Uint8Array;
+  private received: number;
+
+  constructor(head: Uint8Array, size: number) {
+    // A read holds at most the whole payload, as a byte after it would have
+    // dispatched it; if it held more, set would throw rather than drop bytes
+    this.bytes = new Uint8Array(size);
+    this.bytes.set(head);
+    this.received = head.length;
+  }
+
+  /**
+   * Returns the number of bytes of the payload that have arrived.
+   */
+  get length(): number {
+    return this.received;
+  }
+
+  /**
+   * Returns true once the whole payload has arrived.
+   */
+  isComplete(): boolean {
+    return this.received === this.bytes.length;
+  }
+
+  /**
+   * Copies as much of the rest of the payload as read holds from start on,
+   * and returns the number of bytes copied.
+   */
+  fill(read: Uint8Array, start: number): number {
+    const count = Math.min(
+      this.bytes.length - this.received,
+      read.length - start,
+    );
+
+    this.bytes.set(read.subarray(start, start + count), this.received);
+    this.received += count;
+
+    return count;
+  }
+}
+
+// The control line at start began in a previous read: appends it to argBuf
+// up to the next CR or NL in one write instead of byte by byte, and returns
+// the index of the last byte appended; like the byte by byte copy did, it
+// leaves a CR to the CR case, which drops it from the line
+function appendLine(
+  argBuf: DenoBuffer,
+  buf: Uint8Array,
+  start: number,
+): number {
+  const newline = buf.indexOf(cc.NL, start);
+  const lineEnd = newline < 0 ? buf.length : newline;
+
+  // Only search the line for a CR, not the payload after it
+  const cr = buf.subarray(start, lineEnd).indexOf(cc.CR);
+  const end = cr < 0 ? lineEnd : start + cr;
+
+  argBuf.write(buf.subarray(start, end));
+  return end - 1;
+}
+
+// Returns the index of the byte before the CR or NL that ends the control
+// line at start, found with a native scan; if the line continues in the next
+// read, its last byte may be the CR, so that byte is left to the state machine
+function skipLine(buf: Uint8Array, start: number): number {
+  const newline = buf.indexOf(cc.NL, start + 1);
+  if (newline < 0) {
+    return Math.max(start, buf.length - 2);
+  }
+
+  return (buf[newline - 1] === cc.CR ? newline - 1 : newline) - 1;
 }
 
 const ASCII_0 = 48;
@@ -85,6 +171,15 @@ const MAX_64MB = 64 * 1024 * 1024;
 
 // This is an almost verbatim port of the Go NATS parser
 // https://github.com/nats-io/nats.go/blob/master/parser.go
+// The longest control line, HMSG with a reply, has 5 arguments: subject,
+// sid, reply, header size and total size
+const MAX_TOKENS = 5;
+
+function isSeparator(byte: number): boolean {
+  return byte === cc.SPACE || byte === cc.TAB || byte === cc.CR ||
+    byte === cc.NL;
+}
+
 export class Parser {
   dispatcher: Dispatcher<ParserEvent>;
   state: State;
@@ -93,7 +188,9 @@ export class Parser {
   hdr: number;
   ma!: MsgArg;
   argBuf?: DenoBuffer;
-  msgBuf?: DenoBuffer;
+  msgBuf?: SplitPayload;
+  // Bounds [start, end) of each token of the last tokenized control line
+  tokens: Int32Array = new Int32Array(MAX_TOKENS * 2);
 
   constructor(dispatcher: Dispatcher<ParserEvent>) {
     this.dispatcher = dispatcher;
@@ -196,10 +293,12 @@ export class Parser {
               this.drop = 1;
               break;
             case cc.NL: {
-              const arg: Uint8Array = this.argBuf
-                ? this.argBuf.bytes()
-                : buf.subarray(this.as, i - this.drop);
-              this.processMsgArgs(arg);
+              if (this.argBuf) {
+                const arg = this.argBuf.bytes();
+                this.processMsgArgs(arg, 0, arg.length);
+              } else {
+                this.processMsgArgs(buf, this.as, i - this.drop);
+              }
               this.drop = 0;
               this.as = i + 1;
               this.state = State.MSG_PAYLOAD;
@@ -210,35 +309,26 @@ export class Parser {
               break;
             }
             default:
-              if (this.argBuf) {
-                this.argBuf.writeByte(b);
-              }
+              // Move i to the byte before the CR or NL that ends the line, or
+              // to the end of buf, so that the cases above handle it
+              i = this.argBuf
+                ? appendLine(this.argBuf, buf, i)
+                : skipLine(buf, i);
           }
           break;
         case State.MSG_PAYLOAD:
           if (this.msgBuf) {
-            if (this.msgBuf.length >= this.ma.size) {
-              const data = this.msgBuf.bytes({ copy: false });
+            if (this.msgBuf.isComplete()) {
               this.dispatcher.push(
-                { kind: Kind.MSG, msg: this.ma, data: data },
+                { kind: Kind.MSG, msg: this.ma, data: this.msgBuf.bytes },
               );
               this.argBuf = undefined;
               this.msgBuf = undefined;
               this.state = State.MSG_END;
             } else {
-              let toCopy = this.ma.size - this.msgBuf.length;
-              const avail = buf.length - i;
-
-              if (avail < toCopy) {
-                toCopy = avail;
-              }
-
-              if (toCopy > 0) {
-                this.msgBuf.write(buf.subarray(i, i + toCopy));
-                i = (i + toCopy) - 1;
-              } else {
-                this.msgBuf.writeByte(b);
-              }
+              // At least one byte is copied, as both the payload and the read
+              // have some left
+              i += this.msgBuf.fill(buf, i) - 1;
             }
           } else if (i - this.as >= this.ma.size) {
             this.dispatcher.push(
@@ -524,79 +614,91 @@ export class Parser {
     }
 
     if (this.state === State.MSG_PAYLOAD && !this.msgBuf) {
-      if (!this.argBuf) {
-        this.cloneMsgArg();
+      // The payload continues in the next read; the subject and reply are left
+      // as views of this read, like those of a message that fits in one read,
+      // as dispatched messages reference a read's bytes and transports never
+      // reuse its buffer
+      this.msgBuf = new SplitPayload(buf.subarray(this.as), this.ma.size);
+    }
+  }
+
+  // Splits line[pos, end) into at most MAX_TOKENS tokens, recording their
+  // bounds in this.tokens as [start, end) pairs; returns the token count
+  tokenize(line: Uint8Array, pos: number, end: number): number {
+    const tokens = this.tokens;
+    let count = 0;
+
+    while (pos < end) {
+      // Skip separators
+      let byte = line[pos];
+      if (isSeparator(byte)) {
+        pos++;
+        continue;
       }
-      this.msgBuf = new DenoBuffer(buf.subarray(this.as));
-    }
-  }
 
-  cloneMsgArg() {
-    const s = this.ma.subject.length;
-    const r = this.ma.reply ? this.ma.reply.length : 0;
-    const buf = new Uint8Array(s + r);
-    buf.set(this.ma.subject);
-    if (this.ma.reply) {
-      buf.set(this.ma.reply, s);
-    }
-    this.argBuf = new DenoBuffer(buf);
-    this.ma.subject = buf.subarray(0, s);
-    if (this.ma.reply) {
-      this.ma.reply = buf.subarray(s);
-    }
-  }
-
-  processMsgArgs(arg: Uint8Array): void {
-    if (this.hdr >= 0) {
-      return this.processHeaderMsgArgs(arg);
-    }
-
-    const args: Uint8Array[] = [];
-    let start = -1;
-    for (let i = 0; i < arg.length; i++) {
-      const b = arg[i];
-      switch (b) {
-        case cc.SPACE:
-        case cc.TAB:
-        case cc.CR:
-        case cc.NL:
-          if (start >= 0) {
-            args.push(arg.subarray(start, i));
-            start = -1;
-          }
+      // Scan the token
+      const start = pos;
+      for (pos++; pos < end; pos++) {
+        byte = line[pos];
+        if (isSeparator(byte)) {
           break;
-        default:
-          if (start < 0) {
-            start = i;
-          }
+        }
       }
-    }
-    if (start >= 0) {
-      args.push(arg.subarray(start));
+
+      // More arguments than any control line has; report one too many so
+      // the caller fails it as a parse error
+      if (count === MAX_TOKENS) {
+        return count + 1;
+      }
+
+      tokens[count * 2] = start;
+      tokens[count * 2 + 1] = pos;
+      count++;
     }
 
-    switch (args.length) {
+    return count;
+  }
+
+  token(line: Uint8Array, index: number): Uint8Array {
+    return line.subarray(this.tokens[index * 2], this.tokens[index * 2 + 1]);
+  }
+
+  tokenInt(line: Uint8Array, index: number, max?: number): number {
+    return this.parseIntRange(
+      line,
+      this.tokens[index * 2],
+      this.tokens[index * 2 + 1],
+      max,
+    );
+  }
+
+  processMsgArgs(buf: Uint8Array, start: number, end: number): void {
+    if (this.hdr >= 0) {
+      return this.processHeaderMsgArgs(buf, start, end);
+    }
+
+    switch (this.tokenize(buf, start, end)) {
       case 3:
-        this.ma.subject = args[0];
-        this.ma.sid = this.protoParseInt(args[1]);
+        this.ma.subject = this.token(buf, 0);
+        this.ma.sid = this.tokenInt(buf, 1);
         this.ma.reply = undefined;
-        this.ma.size = this.protoParseInt(args[2], MAX_64MB);
+        this.ma.size = this.tokenInt(buf, 2, MAX_64MB);
         break;
       case 4:
-        this.ma.subject = args[0];
-        this.ma.sid = this.protoParseInt(args[1]);
-        this.ma.reply = args[2];
-        this.ma.size = this.protoParseInt(args[3], MAX_64MB);
+        this.ma.subject = this.token(buf, 0);
+        this.ma.sid = this.tokenInt(buf, 1);
+        this.ma.reply = this.token(buf, 2);
+        this.ma.size = this.tokenInt(buf, 3, MAX_64MB);
         break;
       default:
-        throw this.fail(arg, "processMsgArgs Parse Error");
+        throw this.argsError(buf, start, end, "Parse Error");
     }
 
     if (this.ma.sid < 0) {
-      throw this.fail(arg, "processMsgArgs Bad or Missing Sid Error");
+      throw this.argsError(buf, start, end, "Bad or Missing Sid Error");
     }
     if (this.ma.size < 0) {
-      throw this.fail(arg, "processMsgArgs Bad or Missing Size Error");
+      throw this.argsError(buf, start, end, "Bad or Missing Size Error");
     }
   }
 
@@ -610,77 +712,76 @@ export class Parser {
     return new Error(`${label}: ${TD.decode(data)}`);
   }
 
-  processHeaderMsgArgs(arg: Uint8Array): void {
-    const args: Uint8Array[] = [];
-    let start = -1;
-    for (let i = 0; i < arg.length; i++) {
-      const b = arg[i];
-      switch (b) {
-        case cc.SPACE:
-        case cc.TAB:
-        case cc.CR:
-        case cc.NL:
-          if (start >= 0) {
-            args.push(arg.subarray(start, i));
-            start = -1;
-          }
-          break;
-        default:
-          if (start < 0) {
-            start = i;
-          }
-      }
-    }
-    if (start >= 0) {
-      args.push(arg.subarray(start));
-    }
-
-    switch (args.length) {
+  processHeaderMsgArgs(buf: Uint8Array, start: number, end: number): void {
+    switch (this.tokenize(buf, start, end)) {
       case 4:
-        this.ma.subject = args[0];
-        this.ma.sid = this.protoParseInt(args[1]);
+        this.ma.subject = this.token(buf, 0);
+        this.ma.sid = this.tokenInt(buf, 1);
         this.ma.reply = undefined;
-        this.ma.hdr = this.protoParseInt(args[2], MAX_64MB);
-        this.ma.size = this.protoParseInt(args[3], MAX_64MB);
+        this.ma.hdr = this.tokenInt(buf, 2, MAX_64MB);
+        this.ma.size = this.tokenInt(buf, 3, MAX_64MB);
         break;
       case 5:
-        this.ma.subject = args[0];
-        this.ma.sid = this.protoParseInt(args[1]);
-        this.ma.reply = args[2];
-        this.ma.hdr = this.protoParseInt(args[3], MAX_64MB);
-        this.ma.size = this.protoParseInt(args[4], MAX_64MB);
+        this.ma.subject = this.token(buf, 0);
+        this.ma.sid = this.tokenInt(buf, 1);
+        this.ma.reply = this.token(buf, 2);
+        this.ma.hdr = this.tokenInt(buf, 3, MAX_64MB);
+        this.ma.size = this.tokenInt(buf, 4, MAX_64MB);
         break;
       default:
-        throw this.fail(arg, "processHeaderMsgArgs Parse Error");
+        throw this.argsError(buf, start, end, "Parse Error");
     }
 
     if (this.ma.sid < 0) {
-      throw this.fail(arg, "processHeaderMsgArgs Bad or Missing Sid Error");
+      throw this.argsError(buf, start, end, "Bad or Missing Sid Error");
     }
     if (this.ma.hdr < 0 || this.ma.hdr > this.ma.size) {
-      throw this.fail(
-        arg,
-        "processHeaderMsgArgs Bad or Missing Header Size Error",
-      );
+      throw this.argsError(buf, start, end, "Bad or Missing Header Size Error");
     }
     if (this.ma.size < 0) {
-      throw this.fail(arg, "processHeaderMsgArgs Bad or Missing Size Error");
+      throw this.argsError(buf, start, end, "Bad or Missing Size Error");
     }
   }
 
-  protoParseInt(a: Uint8Array, max?: number): number {
-    // max 999_999_999_999_999 - one digit below MAX_SAFE_INTEGER
-    if (a.length === 0 || a.length > 15) {
+  // The error for the malformed MSG or HMSG arguments in buf[start, end); only
+  // built on failure, so that a valid line takes no extra work
+  argsError(
+    buf: Uint8Array,
+    start: number,
+    end: number,
+    problem: string,
+  ): Error {
+    const label = this.hdr >= 0 ? "processHeaderMsgArgs" : "processMsgArgs";
+    return this.fail(buf.subarray(start, end), `${label} ${problem}`);
+  }
+
+  // Same as protoParseInt, over bytes[start, end)
+  parseIntRange(
+    bytes: Uint8Array,
+    start: number,
+    end: number,
+    max?: number,
+  ): number {
+    // Max 999_999_999_999_999, one digit below MAX_SAFE_INTEGER
+    const length = end - start;
+    if (length <= 0 || length > 15) {
       return -1;
     }
-    let n = 0;
-    for (let i = 0; i < a.length; i++) {
-      if (a[i] < ASCII_0 || a[i] > ASCII_9) {
+
+    let value = 0;
+    for (let pos = start; pos < end; pos++) {
+      const byte = bytes[pos];
+      if (byte < ASCII_0 || byte > ASCII_9) {
         return -1;
       }
-      n = n * 10 + (a[i] - ASCII_0);
+      value = value * 10 + (byte - ASCII_0);
     }
-    return max !== undefined && n > max ? -1 : n;
+
+    return max !== undefined && value > max ? -1 : value;
+  }
+
+  protoParseInt(a: Uint8Array, max?: number): number {
+    return this.parseIntRange(a, 0, a.length, max);
   }
 }
 

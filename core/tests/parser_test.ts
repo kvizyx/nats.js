@@ -300,7 +300,8 @@ Deno.test("parser - split msg", () => {
   assertEquals(p.ma.sid, 1);
   assertEquals(td.decode(p.ma.subject), "a");
   assertEquals(td.decode(p.ma.reply), "b");
-  assert(p.argBuf);
+  assertEquals(p.msgBuf?.bytes.length, 103);
+  assertEquals(p.msgBuf?.length, 3);
   const a = "a".charCodeAt(0); //97
   for (let i = 0; i < payload.length; i++) {
     payload[i] = a + (i % 26);
@@ -590,4 +591,103 @@ Deno.test("parser - describe", () => {
     describe({ kind: Kind.INFO, data: te.encode('{"server_id":"test"}') }),
     'INFO: {"server_id":"test"}',
   );
+});
+
+// What a dispatcher received, in a form assertEquals can compare
+function describeMsgs(dispatcher: TestDispatcher) {
+  return dispatcher.msgs.map((event) => {
+    const msg = event.msg!;
+    return [
+      td.decode(msg.subject),
+      msg.reply ? td.decode(msg.reply) : undefined,
+      msg.sid,
+      msg.hdr,
+      msg.size,
+      event.data!.length,
+      td.decode(event.data),
+    ];
+  });
+}
+
+Deno.test("parser - control lines split at any position", () => {
+  const frames = [
+    "MSG foo 1 5\r\nhello\r\n",
+    "MSG foo.bar 22 _INBOX.abc 5\r\nhello\r\n",
+    "MSG\tfoo\t1\t0\r\n\r\n",
+    "HMSG foo 1 12 17\r\nNATS/1.0\r\n\r\nhello\r\n",
+    "HMSG foo.bar 22 _INBOX.abc 12 17\r\nNATS/1.0\r\n\r\nhello\r\n",
+  ];
+
+  for (const frame of frames) {
+    const bytes = te.encode(frame + "PING\r\n");
+    const whole = new TestDispatcher();
+    new Parser(whole).parse(bytes);
+    assertEquals(whole.msgs.length, 1, frame);
+
+    for (let at = 1; at < bytes.length; at++) {
+      const split = new TestDispatcher();
+      const parser = new Parser(split);
+      parser.parse(bytes.slice(0, at));
+      parser.parse(bytes.slice(at));
+      assertEquals(describeMsgs(split), describeMsgs(whole), `${frame} @${at}`);
+      assertEquals(split.pings, 1, `${frame} @${at}`);
+    }
+  }
+});
+
+Deno.test("parser - payloads split across many reads", () => {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz";
+  const payload = (size: number) =>
+    alphabet.repeat(Math.ceil(size / alphabet.length)).slice(0, size);
+
+  const headers = "NATS/1.0\r\nKey: value\r\n\r\n";
+  const frames = [0, 1, 2, 100, 1500, 5000].flatMap((size) => [
+    `MSG foo.${size} 1 ${size}\r\n${payload(size)}\r\n`,
+    `MSG foo.${size} 2 _INBOX.${size} ${size}\r\n${payload(size)}\r\n`,
+    `HMSG foo.${size} 3 ${headers.length} ${headers.length + size}\r\n` +
+    `${headers}${payload(size)}\r\n`,
+  ]);
+  const bytes = te.encode(frames.join("") + "PING\r\n");
+
+  const whole = new TestDispatcher();
+  new Parser(whole).parse(bytes);
+  assertEquals(whole.msgs.length, frames.length);
+
+  for (const readSize of [1, 2, 7, 64, 1499, 4096]) {
+    const split = new TestDispatcher();
+    const parser = new Parser(split);
+    for (let start = 0; start < bytes.length; start += readSize) {
+      parser.parse(bytes.slice(start, start + readSize));
+    }
+
+    const label = `reads of ${readSize}`;
+    assertEquals(describeMsgs(split), describeMsgs(whole), label);
+    assertEquals(split.pings, 1, label);
+    assertEquals(parser.msgBuf, undefined, label);
+  }
+});
+
+Deno.test("parser - malformed control lines fail the same way", () => {
+  const lines = [
+    "MSG foo\r\n",
+    "MSG foo 1\r\n",
+    "MSG foo x 5\r\n",
+    "MSG foo 1 -5\r\n",
+    "MSG foo 1 a b c\r\n",
+    "MSG foo 1 99999999999999999\r\n",
+    "HMSG foo 1 5\r\n",
+    "HMSG foo 1 6 5\r\n",
+    "HMSG foo 1 a b c d\r\n",
+  ];
+
+  for (const line of lines) {
+    const bytes = te.encode(line);
+    assertThrows(() => new Parser(new NoopDispatcher()).parse(bytes));
+
+    // split inside the arguments too
+    const p = new Parser(new NoopDispatcher());
+    const at = line.indexOf(" ") + 2;
+    p.parse(bytes.slice(0, at));
+    assertThrows(() => p.parse(bytes.slice(at)), Error, undefined, line);
+  }
 });
