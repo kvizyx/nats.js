@@ -181,15 +181,17 @@ export class DenoTransport implements Transport {
     // yield what we initially read
     yield this.buf;
 
+    // The read buffer is reused; each frame is copied out because
+    // messages handed to the client reference the frame's bytes
+    this.buf = new Uint8Array(ReadBufferSize);
     while (!this.done) {
       try {
-        this.buf = new Uint8Array(ReadBufferSize);
         const c = await this.conn.read(this.buf);
         if (c === null) {
           break;
         }
         if (c) {
-          const frame = this.buf.subarray(0, c);
+          const frame = this.buf.slice(0, c);
           if (this.options.debug) {
             console.info(`> ${render(frame)}`);
           }
