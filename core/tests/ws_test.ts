@@ -269,3 +269,45 @@ Deno.test("ws - setServers replaces pool and reconnect dials new", async () => {
   await ns0.stop();
   await ns1.stop();
 });
+
+Deno.test("ws - frames larger than the outbound buffer", async () => {
+  const ns = await NatsServer.start(wsServerConf());
+  const nc = await wsconnect({ servers: `ws://127.0.0.1:${ns.websocket}` });
+
+  // Frames over 64KB are handed to the socket as a view of a larger buffer,
+  // which must be sent without the bytes past the view
+  const sizes = [70_000, 200_000, 500_000];
+  const subject = createInbox();
+  const received: Uint8Array[] = [];
+  const done = deferred<void>();
+  nc.subscribe(subject, {
+    callback: (_err, msg) => {
+      received.push(msg.data);
+      if (received.length === sizes.length * 2) {
+        done.resolve();
+      }
+    },
+  });
+  await nc.flush();
+
+  // twice: one at a time, then all in one batch
+  for (const size of sizes) {
+    nc.publish(subject, new Uint8Array(size).fill(size % 251));
+    await nc.flush();
+  }
+  for (const size of sizes) {
+    nc.publish(subject, new Uint8Array(size).fill(size % 251));
+  }
+  await done;
+
+  const expected = [...sizes, ...sizes];
+  assertEquals(received.map((d) => d.length), expected);
+  received.forEach((data, index) => {
+    const fill = expected[index] % 251;
+    assert(data.every((b) => b === fill), `message ${index} was corrupted`);
+  });
+
+  // the connection is still usable, so no frame broke the protocol stream
+  await nc.flush();
+  await cleanup(ns, nc);
+});

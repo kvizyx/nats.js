@@ -12,12 +12,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+import { OutBuffer } from "./outbuffer.ts";
 import { decode, Empty, encode, TE } from "./encoders.ts";
 import type { Transport } from "./transport.ts";
-import { CR_LF, CRLF, getResolveFn, newTransport } from "./transport.ts";
+import { CR_LF, getResolveFn, newTransport } from "./transport.ts";
 import type { Deferred, Delay, Timeout } from "./util.ts";
 import { deferred, delay, extend, timeout } from "./util.ts";
-import { DataBuffer } from "./databuffer.ts";
 import type { ServerImpl } from "./servers.ts";
 import { Servers } from "./servers.ts";
 import { QueuedIteratorImpl } from "./queued_iterator.ts";
@@ -58,6 +58,25 @@ import type {
 } from "./errors.ts";
 
 const FLUSH_THRESHOLD = 1024 * 32;
+
+// A UTF-16 code unit encodes to at most 3 UTF-8 bytes
+const MAX_UTF8_PER_UNIT = 3;
+// String payloads are encoded here rather than into a new array; it is
+// shared by every connection, as publish() copies the bytes into its
+// outbound buffer before returning
+const TEXT_SCRATCH = new Uint8Array(64 * 1024);
+
+// Encodes a string payload. One that fits the scratch buffer is encoded into
+// it without an allocation and returned as a view of it, which stays valid
+// only until the next call; a string that might not fit is encoded on its own
+function encodeText(text: string): Uint8Array {
+  if (text.length * MAX_UTF8_PER_UNIT > TEXT_SCRATCH.length) {
+    return TE.encode(text);
+  }
+
+  const { written } = TE.encodeInto(text, TEXT_SCRATCH);
+  return TEXT_SCRATCH.subarray(0, written);
+}
 
 export const INFO = /^INFO\s+([^\r\n]+)\r\n/i;
 
@@ -396,7 +415,7 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
   info?: ServerInfo;
   muxSubscriptions: MuxSubscription;
   options: ConnectionOptions;
-  outbound: DataBuffer;
+  outbound: OutBuffer;
   pongs: Array<Deferred<void>>;
   subscriptions: Subscriptions;
   transport!: Transport;
@@ -441,7 +460,7 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
     this.publisher = publisher;
     this.subscriptions = new Subscriptions();
     this.muxSubscriptions = new MuxSubscription();
-    this.outbound = new DataBuffer();
+    this.outbound = new OutBuffer();
     this.pongs = [];
     this.whyClosed = "";
     //@ts-ignore: options.pendingLimit is hidden
@@ -926,16 +945,13 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
   }
 
   sendCommand(cmd: string | Uint8Array, ...payloads: Uint8Array[]) {
-    const len = this.outbound.length();
-    let buf: Uint8Array;
-    if (typeof cmd === "string") {
-      buf = encode(cmd);
-    } else {
-      buf = cmd as Uint8Array;
-    }
-    this.outbound.fill(buf, ...payloads);
+    const empty = this.outbound.size() === 0;
+    this.outbound.fill(cmd, ...payloads);
+    this.scheduleFlush(empty);
+  }
 
-    if (len === 0) {
+  private scheduleFlush(wasEmpty: boolean): void {
+    if (wasEmpty) {
       queueMicrotask(() => {
         this.flushPending();
       });
@@ -950,23 +966,14 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
     payload: Payload = Empty,
     options?: PublishOptions,
   ): void {
-    let data;
-    if (payload instanceof Uint8Array) {
-      data = payload;
-    } else if (typeof payload === "string") {
-      data = TE.encode(payload);
-    } else {
-      throw new TypeError(
-        "payload types can be strings or Uint8Array",
-      );
-    }
-
-    let len = data.length;
     options = options || {};
-    options.reply = options.reply || "";
 
-    let headers = Empty;
-    let hlen = 0;
+    // JavaScript callers can pass a subject or reply that isn't a string; the
+    // frame used to be built with a template string, which converted them
+    const subjectText = String(subject);
+    const reply = options.reply ? String(options.reply) : "";
+
+    let headers: Uint8Array | null = null;
     if (options.headers) {
       if (this.info && !this.info.headers) {
         InvalidArgumentError.format(
@@ -976,32 +983,40 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
       }
       const hdrs = options.headers as MsgHdrsImpl;
       headers = hdrs.encode();
-      hlen = headers.length;
-      len = data.length + hlen;
+    }
+
+    // Encoded last, right before the frame copies it: a string goes into the
+    // shared scratch buffer, which a publish from a subject's toString() above
+    // would otherwise overwrite
+    let data: Uint8Array;
+    if (payload instanceof Uint8Array) {
+      data = payload;
+    } else if (typeof payload === "string") {
+      data = encodeText(payload);
+    } else {
+      throw new TypeError(
+        "payload types can be strings or Uint8Array",
+      );
+    }
+
+    let len = data.length;
+    if (headers) {
+      len += headers.length;
     }
 
     if (this.info && len > this.info.max_payload) {
       throw InvalidArgumentError.format("payload", "max_payload size exceeded");
     }
+
+    const empty = this.outbound.size() === 0;
+    this.outbound.writeMsg(subjectText, reply, headers, data);
+
+    // Counted once the frame is written, so that a publish that throws
+    // isn't counted
     this.outBytes += len;
     this.outMsgs++;
 
-    let proto: string;
-    if (options.headers) {
-      if (options.reply) {
-        proto = `HPUB ${subject} ${options.reply} ${hlen} ${len}\r\n`;
-      } else {
-        proto = `HPUB ${subject} ${hlen} ${len}\r\n`;
-      }
-      this.sendCommand(proto, headers, data, CRLF);
-    } else {
-      if (options.reply) {
-        proto = `PUB ${subject} ${options.reply} ${len}\r\n`;
-      } else {
-        proto = `PUB ${subject} ${len}\r\n`;
-      }
-      this.sendCommand(proto, data, CRLF);
-    }
+    this.scheduleFlush(empty);
   }
 
   request(r: Request): Request {

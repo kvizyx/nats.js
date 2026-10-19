@@ -264,7 +264,7 @@ export class WsTransport implements Transport {
       return;
     }
     try {
-      this.socket.send(frame.buffer);
+      this.socket.send(frame);
       if (this.options.debug) {
         console.info(`< ${render(frame)}`);
       }
